@@ -6,6 +6,7 @@ import {
   MatchPeriod,
 } from '../repositories/analytics.repository';
 import { MarketMetrics, MetricService, MetricsResult } from './metric.service';
+import { OpponentModelService } from './opponent-model.service';
 
 export interface TeamSummary {
   teamId: string;
@@ -49,6 +50,7 @@ export class GetMatchSummaryUseCase {
   constructor(
     private readonly repo: AnalyticsRepository,
     private readonly metrics: MetricService,
+    private readonly model: OpponentModelService,
   ) {}
 
   async execute(matchId: string, period?: MatchPeriod): Promise<MatchSummary> {
@@ -60,47 +62,94 @@ export class GetMatchSummaryUseCase {
     // o que torna honesta a comparação previsão × resultado.
     const before = match.kickoffAt;
 
-    const homeCounts = await this.repo.getPerMatchCardCounts({
-      teamId: match.homeTeamId,
-      period,
-      before,
-    });
-    const awayCounts = await this.repo.getPerMatchCardCounts({
-      teamId: match.awayTeamId,
-      period,
-      before,
-    });
-    const homeStats = await this.repo.getPerMatchTeamStats({
-      teamId: match.homeTeamId,
-      before,
-    });
-    const awayStats = await this.repo.getPerMatchTeamStats({
-      teamId: match.awayTeamId,
-      before,
-    });
-    const homeGoals = await this.repo.getPerMatchGoalsFor(
-      match.homeTeamId,
-      period,
-      before,
-    );
-    const awayGoals = await this.repo.getPerMatchGoalsFor(
-      match.awayTeamId,
-      period,
-      before,
-    );
+    let homeMetrics: MarketMetrics;
+    let awayMetrics: MarketMetrics;
+    let homeSample: number;
+    let awaySample: number;
+    let homeShotSample: number;
+    let awayShotSample: number;
+    let matchTotal: MatchSummary['matchTotal'];
 
-    const matchTotal =
-      homeCounts.length > 0 && awayCounts.length > 0
-        ? {
-            metrics: {
-              ...this.metrics.convolve(homeCounts, awayCounts),
-              ...this.metrics.convolveStats(homeStats, awayStats),
-              goals: this.metrics.convolveGoals(homeGoals, awayGoals),
-            } as MarketMetrics,
-            bothTeamsScore: this.metrics.bothTeamsScore(homeGoals, awayGoals),
-            assumesIndependence: true as const,
-          }
-        : null;
+    if (!period) {
+      // JOGO INTEIRO → modelo com ajuste de adversário (ataque × defesa, Poisson).
+      const [homeRatings, awayRatings, league] = await Promise.all([
+        this.repo.getTeamMarketRatings(match.homeTeamId, before),
+        this.repo.getTeamMarketRatings(match.awayTeamId, before),
+        this.repo.getLeagueMarketAverages(before),
+      ]);
+      const modeled = this.model.build(homeRatings, awayRatings, league);
+      homeMetrics = modeled.home;
+      awayMetrics = modeled.away;
+      homeSample = homeRatings.totalCards.games;
+      awaySample = awayRatings.totalCards.games;
+      homeShotSample = homeRatings.shots.games;
+      awayShotSample = awayRatings.shots.games;
+      matchTotal =
+        homeSample > 0 && awaySample > 0
+          ? {
+              metrics: modeled.total,
+              bothTeamsScore: modeled.bothTeamsScore,
+              assumesIndependence: true as const,
+            }
+          : null;
+    } else {
+      // RECORTE POR TEMPO (1º/2º) → mantém o empírico (só gols/cartões têm minuto).
+      const homeCounts = await this.repo.getPerMatchCardCounts({
+        teamId: match.homeTeamId,
+        period,
+        before,
+      });
+      const awayCounts = await this.repo.getPerMatchCardCounts({
+        teamId: match.awayTeamId,
+        period,
+        before,
+      });
+      const homeStats = await this.repo.getPerMatchTeamStats({
+        teamId: match.homeTeamId,
+        before,
+      });
+      const awayStats = await this.repo.getPerMatchTeamStats({
+        teamId: match.awayTeamId,
+        before,
+      });
+      const homeGoals = await this.repo.getPerMatchGoalsFor(
+        match.homeTeamId,
+        period,
+        before,
+      );
+      const awayGoals = await this.repo.getPerMatchGoalsFor(
+        match.awayTeamId,
+        period,
+        before,
+      );
+
+      homeMetrics = {
+        ...this.metrics.compute(homeCounts),
+        ...this.metrics.computeStats(homeStats),
+        goals: this.metrics.computeGoals(homeGoals),
+      };
+      awayMetrics = {
+        ...this.metrics.compute(awayCounts),
+        ...this.metrics.computeStats(awayStats),
+        goals: this.metrics.computeGoals(awayGoals),
+      };
+      homeSample = homeCounts.length;
+      awaySample = awayCounts.length;
+      homeShotSample = homeStats.length;
+      awayShotSample = awayStats.length;
+      matchTotal =
+        homeCounts.length > 0 && awayCounts.length > 0
+          ? {
+              metrics: {
+                ...this.metrics.convolve(homeCounts, awayCounts),
+                ...this.metrics.convolveStats(homeStats, awayStats),
+                goals: this.metrics.convolveGoals(homeGoals, awayGoals),
+              } as MarketMetrics,
+              bothTeamsScore: this.metrics.bothTeamsScore(homeGoals, awayGoals),
+              assumesIndependence: true as const,
+            }
+          : null;
+    }
 
     let referee: RefereeSummary | null = null;
     if (match.refereeId) {
@@ -132,23 +181,15 @@ export class GetMatchSummaryUseCase {
       },
       home: {
         teamId: match.homeTeamId,
-        sampleSize: homeCounts.length,
-        shotSampleSize: homeStats.length,
-        metrics: {
-          ...this.metrics.compute(homeCounts),
-          ...this.metrics.computeStats(homeStats),
-          goals: this.metrics.computeGoals(homeGoals),
-        },
+        sampleSize: homeSample,
+        shotSampleSize: homeShotSample,
+        metrics: homeMetrics,
       },
       away: {
         teamId: match.awayTeamId,
-        sampleSize: awayCounts.length,
-        shotSampleSize: awayStats.length,
-        metrics: {
-          ...this.metrics.compute(awayCounts),
-          ...this.metrics.computeStats(awayStats),
-          goals: this.metrics.computeGoals(awayGoals),
-        },
+        sampleSize: awaySample,
+        shotSampleSize: awayShotSample,
+        metrics: awayMetrics,
       },
       referee,
       matchTotal,

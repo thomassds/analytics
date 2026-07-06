@@ -28,6 +28,7 @@ import { MetricService } from './analytics/metric.service';
 import { ValueService } from './analytics/value.service';
 import { GetHistoryUseCase } from './analytics/get-history.use-case';
 import { GetMatchSummaryUseCase } from './analytics/get-match-summary.use-case';
+import { OpponentModelService } from './analytics/opponent-model.service';
 import { GetOpportunitiesUseCase } from './analytics/get-opportunities.use-case';
 import { SnapshotAnalysisUseCase } from './analytics/snapshot-analysis.use-case';
 import { GetMatchDetailUseCase } from './analytics/get-match-detail.use-case';
@@ -67,6 +68,7 @@ import { ImageProxyController } from './analytics/image-proxy.controller';
     LiveCron,
     DistributionService,
     MetricService,
+    OpponentModelService,
     ValueService,
     GetHistoryUseCase,
     GetMatchSummaryUseCase,

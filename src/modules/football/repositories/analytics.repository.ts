@@ -20,6 +20,27 @@ export interface PerMatchTeamStats {
 
 export type MatchPeriod = 'first' | 'second';
 
+/** Força de um time num mercado: média produzida (for) e sofrida (against). */
+export interface MarketRating {
+  for: number;
+  against: number;
+  games: number;
+}
+export type MarketKey =
+  | 'goals'
+  | 'totalCards'
+  | 'yellowCards'
+  | 'redCards'
+  | 'weighted'
+  | 'shots'
+  | 'shotsOnGoal'
+  | 'corners'
+  | 'fouls'
+  | 'offsides'
+  | 'saves';
+export type TeamRatings = Record<MarketKey, MarketRating>;
+export type LeagueAverages = Record<MarketKey, number>;
+
 /** Valores REALIZADOS do jogo por mercado (pra comparar com a previsão). */
 export interface MatchActuals {
   goals: number;
@@ -175,6 +196,11 @@ export class AnalyticsRepository {
     `;
     const finished = MatchStatus.FINISHED;
     const pc = periodClause('me', filter.period);
+    // Só conta jogos cujos eventos foram ingeridos (~43% das partidas vieram só
+    // com placar básico, sem eventos). Sem isso, esses jogos entram como "0
+    // cartões" falsos e derrubam a média. Todo jogo ingerido tem escalação
+    // (category='appearance'), então "tem algum evento" = "foi ingerido".
+    const hasEv = `AND EXISTS (SELECT 1 FROM match_events mev WHERE mev.match_id = m.id)`;
     // corte as-of: acrescenta `AND m.kickoff_at < $N` empurrando `before` nos params
     const beforeAnd = (p: any[]): string => {
       if (!filter.before) return '';
@@ -194,7 +220,7 @@ export class AnalyticsRepository {
         LEFT JOIN match_events me ON me.match_id = m.id AND me.team_id = $1
           AND me.event_type_id IN ${cardTypes} ${pc}
         LEFT JOIN event_types et ON et.id = me.event_type_id
-        WHERE (m.home_team_id = $1 OR m.away_team_id = $1) AND m.status = $2 ${bc}
+        WHERE (m.home_team_id = $1 OR m.away_team_id = $1) AND m.status = $2 ${bc} ${hasEv}
         GROUP BY m.id`;
     } else if (filter.playerId) {
       params = [filter.playerId, finished];
@@ -221,7 +247,7 @@ export class AnalyticsRepository {
         LEFT JOIN match_events me ON me.match_id = m.id
           AND me.event_type_id IN ${cardTypes} ${pc}
         LEFT JOIN event_types et ON et.id = me.event_type_id
-        WHERE m.referee_id = $1 AND m.status = $2 ${bc}
+        WHERE m.referee_id = $1 AND m.status = $2 ${bc} ${hasEv}
         GROUP BY m.id`;
     } else if (filter.competitionId) {
       params = [filter.competitionId, finished];
@@ -232,7 +258,7 @@ export class AnalyticsRepository {
         LEFT JOIN match_events me ON me.match_id = m.id
           AND me.event_type_id IN ${cardTypes} ${pc}
         LEFT JOIN event_types et ON et.id = me.event_type_id
-        WHERE m.competition_id = $1 AND m.status = $2 ${bc}
+        WHERE m.competition_id = $1 AND m.status = $2 ${bc} ${hasEv}
         GROUP BY m.id`;
     } else {
       // total de cada partida finalizada (sem filtro)
@@ -244,7 +270,7 @@ export class AnalyticsRepository {
         LEFT JOIN match_events me ON me.match_id = m.id
           AND me.event_type_id IN ${cardTypes} ${pc}
         LEFT JOIN event_types et ON et.id = me.event_type_id
-        WHERE m.status = $1 ${bc}
+        WHERE m.status = $1 ${bc} ${hasEv}
         GROUP BY m.id`;
     }
 
@@ -279,6 +305,7 @@ export class AnalyticsRepository {
        LEFT JOIN match_events me ON me.match_id = m.id AND me.team_id = $1
          AND me.event_type_id IN ${goalType} ${pc}
        WHERE (m.home_team_id = $1 OR m.away_team_id = $1) AND m.status = $2 ${bc}
+         AND EXISTS (SELECT 1 FROM match_events mev WHERE mev.match_id = m.id)
        GROUP BY m.id`,
       params,
     );
@@ -346,5 +373,164 @@ export class AnalyticsRepository {
       offsides: num(r.offsides),
       saves: num(r.saves),
     }));
+  }
+
+  /**
+   * Força de um time em cada mercado: média produzida (for) e sofrida (against),
+   * sobre os jogos finalizados já ingeridos (com corte as-of). Alimenta o modelo
+   * de adversário (ataque × defesa). Cartões/gols vêm de match_events; o resto de
+   * match_stats (linha do time × linha do adversário).
+   */
+  async getTeamMarketRatings(
+    teamId: string,
+    before?: Date,
+  ): Promise<TeamRatings> {
+    const finished = MatchStatus.FINISHED;
+    const N = (v: any): number => (v == null ? 0 : Number(v));
+
+    // corte as-of compartilhado
+    const p1: any[] = [teamId, finished];
+    let bc1 = '';
+    if (before) {
+      p1.push(before);
+      bc1 = `AND m.kickoff_at < $${p1.length}`;
+    }
+    const hasEv = `AND EXISTS (SELECT 1 FROM match_events mev WHERE mev.match_id = m.id)`;
+
+    // 1) Cartões (for = do time, against = do adversário) por partida → médias
+    const cardSql = `
+      WITH per AS (
+        SELECT m.id,
+          SUM(CASE WHEN me.team_id = $1 AND et.code='YELLOW_CARD'   THEN 1 ELSE 0 END) AS ty,
+          SUM(CASE WHEN me.team_id = $1 AND et.code='SECOND_YELLOW' THEN 1 ELSE 0 END) AS ts,
+          SUM(CASE WHEN me.team_id = $1 AND et.code='RED_CARD'      THEN 1 ELSE 0 END) AS tr,
+          SUM(CASE WHEN me.team_id <> $1 AND et.code='YELLOW_CARD'   THEN 1 ELSE 0 END) AS oy,
+          SUM(CASE WHEN me.team_id <> $1 AND et.code='SECOND_YELLOW' THEN 1 ELSE 0 END) AS os,
+          SUM(CASE WHEN me.team_id <> $1 AND et.code='RED_CARD'      THEN 1 ELSE 0 END) AS orr
+        FROM matches m
+        LEFT JOIN match_events me ON me.match_id = m.id
+          AND me.event_type_id IN (SELECT id FROM event_types WHERE category IN ('yellow','red'))
+        LEFT JOIN event_types et ON et.id = me.event_type_id
+        WHERE (m.home_team_id = $1 OR m.away_team_id = $1) AND m.status = $2 ${bc1} ${hasEv}
+        GROUP BY m.id)
+      SELECT COUNT(*)::int AS games,
+        AVG(ty+ts+tr) AS total_for,       AVG(oy+os+orr) AS total_against,
+        AVG(ty+ts)    AS yellow_for,      AVG(oy+os)     AS yellow_against,
+        AVG(tr+ts)    AS red_for,         AVG(orr+os)    AS red_against,
+        AVG(ty+ts+tr*2) AS weighted_for,  AVG(oy+os+orr*2) AS weighted_against
+      FROM per`;
+
+    // 2) Gols marcados (for) e sofridos (against)
+    const goalSql = `
+      WITH per AS (
+        SELECT m.id,
+          SUM(CASE WHEN me.team_id = $1 THEN 1 ELSE 0 END) AS gf,
+          SUM(CASE WHEN me.team_id <> $1 THEN 1 ELSE 0 END) AS ga
+        FROM matches m
+        LEFT JOIN match_events me ON me.match_id = m.id
+          AND me.event_type_id IN (SELECT id FROM event_types WHERE code='GOAL')
+        WHERE (m.home_team_id = $1 OR m.away_team_id = $1) AND m.status = $2 ${bc1} ${hasEv}
+        GROUP BY m.id)
+      SELECT COUNT(*)::int AS games, AVG(gf) AS goals_for, AVG(ga) AS goals_against FROM per`;
+
+    // 3) Chutes/escanteios/etc: linha do time (t) × linha do adversário (o)
+    const statSql = `
+      SELECT COUNT(*)::int AS games,
+        AVG(t.total_shots) AS shots_for,        AVG(o.total_shots) AS shots_against,
+        AVG(t.shots_on_goal) AS ong_for,        AVG(o.shots_on_goal) AS ong_against,
+        AVG(t.corner_kicks) AS corners_for,     AVG(o.corner_kicks) AS corners_against,
+        AVG(t.fouls) AS fouls_for,              AVG(o.fouls) AS fouls_against,
+        AVG(t.offsides) AS offsides_for,        AVG(o.offsides) AS offsides_against,
+        AVG(t.goalkeeper_saves) AS saves_for,   AVG(o.goalkeeper_saves) AS saves_against
+      FROM matches m
+      JOIN match_stats t ON t.match_id = m.id AND t.team_id = $1
+      JOIN match_stats o ON o.match_id = m.id AND o.team_id <> $1
+      WHERE (m.home_team_id = $1 OR m.away_team_id = $1) AND m.status = $2 ${bc1}`;
+
+    const [[c], [g], [s]] = await Promise.all([
+      this.db.query(cardSql, p1),
+      this.db.query(goalSql, p1),
+      this.db.query(statSql, p1),
+    ]);
+
+    const cg = N(c?.games);
+    const gg = N(g?.games);
+    const sg = N(s?.games);
+    const rate = (f: any, a: any, games: number): MarketRating => ({
+      for: N(f),
+      against: N(a),
+      games,
+    });
+
+    return {
+      goals: rate(g?.goals_for, g?.goals_against, gg),
+      totalCards: rate(c?.total_for, c?.total_against, cg),
+      yellowCards: rate(c?.yellow_for, c?.yellow_against, cg),
+      redCards: rate(c?.red_for, c?.red_against, cg),
+      weighted: rate(c?.weighted_for, c?.weighted_against, cg),
+      shots: rate(s?.shots_for, s?.shots_against, sg),
+      shotsOnGoal: rate(s?.ong_for, s?.ong_against, sg),
+      corners: rate(s?.corners_for, s?.corners_against, sg),
+      fouls: rate(s?.fouls_for, s?.fouls_against, sg),
+      offsides: rate(s?.offsides_for, s?.offsides_against, sg),
+      saves: rate(s?.saves_for, s?.saves_against, sg),
+    };
+  }
+
+  /**
+   * Médias da liga por mercado = valor médio POR TIME por jogo (baseline μ do
+   * modelo). Mesmo universo (jogos ingeridos, as-of). Cartões/gols: total/(2×jogos);
+   * stats: AVG direto sobre as linhas de match_stats (cada linha já é um time-jogo).
+   */
+  async getLeagueMarketAverages(before?: Date): Promise<LeagueAverages> {
+    const finished = MatchStatus.FINISHED;
+    const N = (v: any): number => (v == null ? 0 : Number(v));
+    const p: any[] = [finished];
+    let bc = '';
+    if (before) {
+      p.push(before);
+      bc = `AND m.kickoff_at < $${p.length}`;
+    }
+    const hasEv = `AND EXISTS (SELECT 1 FROM match_events mev WHERE mev.match_id = m.id)`;
+
+    const evSql = `
+      SELECT COUNT(DISTINCT m.id)::int AS matches,
+        SUM(CASE WHEN et.category IN ('yellow','red') THEN 1 ELSE 0 END) AS cards_total,
+        SUM(CASE WHEN et.code IN ('YELLOW_CARD','SECOND_YELLOW') THEN 1 ELSE 0 END) AS cards_yellow,
+        SUM(CASE WHEN et.code IN ('RED_CARD','SECOND_YELLOW') THEN 1 ELSE 0 END) AS cards_red,
+        SUM(CASE WHEN et.code IN ('YELLOW_CARD','SECOND_YELLOW') THEN 1 WHEN et.code='RED_CARD' THEN 2 ELSE 0 END) AS cards_weighted,
+        SUM(CASE WHEN et.code='GOAL' THEN 1 ELSE 0 END) AS goals
+      FROM matches m
+      LEFT JOIN match_events me ON me.match_id = m.id
+      LEFT JOIN event_types et ON et.id = me.event_type_id
+      WHERE m.status = $1 ${bc} ${hasEv}`;
+
+    const statSql = `
+      SELECT AVG(ms.total_shots) AS shots, AVG(ms.shots_on_goal) AS ong,
+             AVG(ms.corner_kicks) AS corners, AVG(ms.fouls) AS fouls,
+             AVG(ms.offsides) AS offsides, AVG(ms.goalkeeper_saves) AS saves
+      FROM match_stats ms JOIN matches m ON m.id = ms.match_id
+      WHERE m.status = $1 ${bc}`;
+
+    const [[e], [s]] = await Promise.all([
+      this.db.query(evSql, p),
+      this.db.query(statSql, p),
+    ]);
+    const matches = Math.max(1, N(e?.matches));
+    const perTeam = (total: any): number => N(total) / (2 * matches);
+
+    return {
+      goals: perTeam(e?.goals),
+      totalCards: perTeam(e?.cards_total),
+      yellowCards: perTeam(e?.cards_yellow),
+      redCards: perTeam(e?.cards_red),
+      weighted: perTeam(e?.cards_weighted),
+      shots: N(s?.shots),
+      shotsOnGoal: N(s?.ong),
+      corners: N(s?.corners),
+      fouls: N(s?.fouls),
+      offsides: N(s?.offsides),
+      saves: N(s?.saves),
+    };
   }
 }
