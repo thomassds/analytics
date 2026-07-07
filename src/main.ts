@@ -7,7 +7,8 @@ import { GlobalExceptionFilter } from './common/filters/global-exception.filter'
 import { rabbitMQMicroservices } from './config/rabbitmq.config';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  // rawBody: preserva o corpo cru p/ validar a assinatura do webhook da Stripe
+  const app = await NestFactory.create(AppModule, { rawBody: true });
 
   app.enableCors({
     origin: [

@@ -6,6 +6,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from './modules/auth/auth.module';
 import { MessagingModule } from './modules/messaging/messaging.module';
 import { FootballModule } from './modules/football/football.module';
+import { BillingModule } from './modules/billing/billing.module';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 
 @Module({
@@ -38,6 +39,7 @@ import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
     AuthModule,
     MessagingModule,
     FootballModule,
+    BillingModule,
   ],
   providers: [
     {
